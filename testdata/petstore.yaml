@@ -1,0 +1,274 @@
+openapi: "3.0.3"
+info:
+  title: Petstore
+  version: "1.0.0"
+  description: A sample Petstore API for testing ogen-mcp code generation.
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      summary: List all pets
+      tags:
+        - pets
+      parameters:
+        - name: status
+          in: query
+          description: Filter by pet status
+          required: false
+          schema:
+            type: string
+            enum:
+              - available
+              - pending
+              - sold
+        - name: limit
+          in: query
+          description: Maximum number of pets to return
+          required: false
+          schema:
+            type: integer
+            format: int32
+      responses:
+        "200":
+          description: A list of pets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Pet"
+    post:
+      operationId: createPet
+      summary: Create a pet
+      tags:
+        - pets
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePetRequest"
+      responses:
+        "201":
+          description: Pet created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+  /pets/{petId}:
+    get:
+      operationId: showPetById
+      summary: Get a pet by ID
+      tags:
+        - pets
+      parameters:
+        - name: petId
+          in: path
+          description: The ID of the pet to retrieve
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: A pet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+    put:
+      operationId: updatePet
+      summary: Update a pet
+      tags:
+        - pets
+      parameters:
+        - name: petId
+          in: path
+          description: The ID of the pet to update
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePetRequest"
+      responses:
+        "200":
+          description: Pet updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+    delete:
+      operationId: deletePet
+      summary: Delete a pet
+      tags:
+        - pets
+      parameters:
+        - name: petId
+          in: path
+          description: The ID of the pet to delete
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "204":
+          description: Pet deleted
+  /orders:
+    get:
+      operationId: listOrders
+      summary: List all orders
+      tags:
+        - orders
+      parameters:
+        - name: limit
+          in: query
+          description: Maximum number of orders to return
+          required: false
+          schema:
+            type: integer
+            format: int32
+      responses:
+        "200":
+          description: A list of orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Order"
+    post:
+      operationId: createOrder
+      summary: Create an order
+      tags:
+        - orders
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOrderRequest"
+      responses:
+        "201":
+          description: Order created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+  /internal/health:
+    get:
+      operationId: healthCheck
+      summary: Health check endpoint
+      tags:
+        - internal
+      x-mcp-exclude: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+  /pets/{petId}/tags:
+    post:
+      operationId: addPetTag
+      summary: Add a tag to a pet
+      tags:
+        - pets
+      x-mcp-domain: tag_pet
+      parameters:
+        - name: petId
+          in: path
+          description: The ID of the pet
+          required: true
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - tag
+              properties:
+                tag:
+                  type: string
+                  description: The tag to add
+      responses:
+        "200":
+          description: Tag added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+components:
+  schemas:
+    Pet:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        status:
+          type: string
+          enum:
+            - available
+            - pending
+            - sold
+        tags:
+          type: array
+          items:
+            type: string
+    CreatePetRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          enum:
+            - available
+            - pending
+            - sold
+    Order:
+      type: object
+      required:
+        - id
+        - petId
+      properties:
+        id:
+          type: integer
+          format: int64
+        petId:
+          type: integer
+          format: int64
+        quantity:
+          type: integer
+          format: int32
+    CreateOrderRequest:
+      type: object
+      required:
+        - petId
+      properties:
+        petId:
+          type: integer
+          format: int64
+        quantity:
+          type: integer
+          format: int32
