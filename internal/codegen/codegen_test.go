@@ -68,6 +68,17 @@ func TestGeneratePetstore(t *testing.T) {
 	assert.Contains(t, output, "func ParseExecuteResult")
 	assert.Contains(t, output, "type ExecuteResponse struct")
 
+	// Body handling: a single body field with an encoding modifier
+	// (json default, text, base64), normalized to bytes before the
+	// transport; binary responses come back base64-encoded.
+	assert.Contains(t, output, "func normalizeBody")
+	assert.Contains(t, output, `field "encoding" must be "json", "text" or "base64"`)
+	assert.Contains(t, output, `field "encoding" requires "body"`)
+	assert.Contains(t, output, "base64.StdEncoding.DecodeString")
+	assert.Contains(t, output, "base64.StdEncoding.EncodeToString(respBody)")
+	assert.Contains(t, output, "func WithTextBody")
+	assert.Contains(t, output, "func WithBinaryBody")
+
 	// User-code JS errors must surface as IsError tool results, not Go
 	// errors, so MCP consumers can forward them in a tool_result block.
 	// See https://github.com/savid/ogen-mcp/issues/2.
