@@ -437,14 +437,21 @@ return matches.map(op => ({id: op.operationId, method: op.method, path: op.path}
 
 	executeDescription := fmt.Sprintf(strings.TrimSpace(`Execute API requests by running JavaScript against the 'api' helper.
 
-Use api.request({ method, path, pathParams?, query?, headers?, body? }) to perform one or more requests.
+Use api.request({ method, path, pathParams?, query?, headers?, body?, encoding? }) to perform one or more requests.
+
+'body' is JSON-encoded and sent as application/json by default. For non-JSON payloads set 'encoding': "text" (body is a string, sent as UTF-8 text/plain) or "base64" (body is a base64 string, decoded and sent as raw bytes, application/octet-stream); an explicit Content-Type header overrides these defaults. pathParams values are percent-encoded, so multi-segment path values must be inlined into 'path' instead.
+
+Each request returns { statusCode, headers, body, encoding? }: body is parsed JSON when possible, plain text otherwise; binary response bodies come back base64-encoded with encoding: "base64".
 
 Limits: max_requests=%d, timeout=%s, max_response_bytes=%d, max_output_bytes=%d.
 
 Example (multi-request):
 const a = api.request({ method: "GET", path: "/orders", query: { limit: 3 } });
 const b = api.request({ method: "GET", path: "/pets", query: { limit: 3 } });
-return { orders: a, pets: b };`),
+return { orders: a, pets: b };
+
+Example (raw upload):
+return api.request({ method: "PUT", path: "/files/report.txt", body: "hello", encoding: "text" });`),
 		opts.ExecuteMaxRequests,
 		opts.ExecuteTimeout,
 		opts.ExecuteMaxResponseBytes,

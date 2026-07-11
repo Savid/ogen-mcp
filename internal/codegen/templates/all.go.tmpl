@@ -4,6 +4,7 @@ package {{ .PackageName }}
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dop251/goja"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -38,12 +40,16 @@ type CodeInput struct {
 
 // APIRequest is a normalized API request built from execute() code.
 type APIRequest struct {
-	Method       string
-	Path         string
-	PathParams   map[string]string
-	Query        map[string]any
-	Headers      map[string]string
-	Body         any
+	Method     string
+	Path       string
+	PathParams map[string]string
+	Query      map[string]any
+	Headers    map[string]string
+	// Body holds the exact request bytes to send: nil means no body, a
+	// non-nil empty slice means an empty body. normalizeAPIRequest
+	// resolves JSON/text/base64 inputs into bytes and defaults the
+	// Content-Type header, so transports never re-encode.
+	Body         []byte
 	MaxRedirects int
 }
 
@@ -52,6 +58,9 @@ type APIResponse struct {
 	StatusCode int
 	Headers    map[string]string
 	Body       any
+	// BodyEncoding is "base64" when Body carries base64-encoded bytes
+	// (the response was neither JSON nor valid UTF-8), empty otherwise.
+	BodyEncoding string
 }
 
 // APITransport executes normalized API requests for the generated engine.
@@ -121,20 +130,12 @@ func (t *HTTPTransport) DoAPIRequest(ctx context.Context, req APIRequest) (*APIR
 
 	var bodyReader io.Reader
 	if req.Body != nil {
-		data, err := json.Marshal(req.Body)
-		if err != nil {
-			return nil, fmt.Errorf("encoding request body: %w", err)
-		}
-		bodyReader = bytes.NewReader(data)
+		bodyReader = bytes.NewReader(req.Body)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, req.Method, reqURL, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("creating HTTP request: %w", err)
-	}
-
-	if req.Body != nil {
-		httpReq.Header.Set("Content-Type", "application/json")
 	}
 
 	for k, v := range req.Headers {
@@ -164,16 +165,26 @@ func (t *HTTPTransport) DoAPIRequest(ctx context.Context, req APIRequest) (*APIR
 	}
 
 	var body any
+	var bodyEncoding string
 	if len(respBody) > 0 {
-		if jsonErr := json.Unmarshal(respBody, &body); jsonErr != nil {
+		switch {
+		case json.Unmarshal(respBody, &body) == nil:
+		case utf8.Valid(respBody):
 			body = string(respBody)
+		default:
+			// Binary payload: a Go string of invalid UTF-8 would be
+			// mangled to U+FFFD when re-marshaled into the tool result,
+			// so carry the bytes losslessly as base64 instead.
+			body = base64.StdEncoding.EncodeToString(respBody)
+			bodyEncoding = "base64"
 		}
 	}
 
 	return &APIResponse{
-		StatusCode: httpResp.StatusCode,
-		Headers:    respHeaders,
-		Body:       body,
+		StatusCode:   httpResp.StatusCode,
+		Headers:      respHeaders,
+		Body:         body,
+		BodyEncoding: bodyEncoding,
 	}, nil
 }
 
@@ -399,6 +410,9 @@ func (e *JSEngine) apiRequestFunc(
 			"headers":    resp.Headers,
 			"body":       clampBody(resp.Body, e.opts.ExecuteMaxResponseBytes),
 		}
+		if resp.BodyEncoding != "" {
+			result["encoding"] = resp.BodyEncoding
+		}
 
 		payload, err := json.Marshal(result)
 		if err != nil {
@@ -472,11 +486,74 @@ func normalizeAPIRequest(input map[string]any) (APIRequest, error) {
 		req.Headers = toStringMap(rawHeaders)
 	}
 
-	if body, ok := input["body"]; ok {
-		req.Body = body
+	body, contentType, err := normalizeBody(input)
+	if err != nil {
+		return APIRequest{}, err
+	}
+	req.Body = body
+	if contentType != "" && !hasHeader(req.Headers, "Content-Type") {
+		if req.Headers == nil {
+			req.Headers = make(map[string]string, 1)
+		}
+		req.Headers["Content-Type"] = contentType
 	}
 
 	return req, nil
+}
+
+// normalizeBody resolves the body/encoding fields into request bytes and
+// a default Content-Type. Returns (nil, "", nil) when no body was given;
+// note JSON null and empty strings are present-but-possibly-empty bodies,
+// distinct from absent.
+func normalizeBody(input map[string]any) ([]byte, string, error) {
+	body, bodyOK := input["body"]
+
+	encoding := "json"
+	if rawEnc, encOK := input["encoding"]; encOK {
+		s, isString := rawEnc.(string)
+		if !isString || (s != "json" && s != "text" && s != "base64") {
+			return nil, "", errors.New(`field "encoding" must be "json", "text" or "base64"`)
+		}
+		if !bodyOK {
+			return nil, "", errors.New(`field "encoding" requires "body"`)
+		}
+		encoding = s
+	}
+
+	if !bodyOK {
+		return nil, "", nil
+	}
+
+	switch encoding {
+	case "text", "base64":
+		s, isString := body.(string)
+		if !isString {
+			return nil, "", fmt.Errorf(`field "body" must be a string when encoding is %q`, encoding)
+		}
+		if encoding == "text" {
+			return []byte(s), "text/plain; charset=utf-8", nil
+		}
+		decoded, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return nil, "", fmt.Errorf("decoding base64 body: %w", err)
+		}
+		return decoded, "application/octet-stream", nil
+	default:
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, "", fmt.Errorf("encoding request body: %w", err)
+		}
+		return data, "application/json", nil
+	}
+}
+
+func hasHeader(headers map[string]string, name string) bool {
+	for k := range headers {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolvePath(path string, params map[string]string) string {
@@ -664,6 +741,22 @@ func WithBody(b any) RequestOption {
 	return func(r map[string]any) { r["body"] = b }
 }
 
+// WithTextBody adds a plain-text body to the request.
+func WithTextBody(s string) RequestOption {
+	return func(r map[string]any) {
+		r["body"] = s
+		r["encoding"] = "text"
+	}
+}
+
+// WithBinaryBody adds a binary body to the request, carried as base64.
+func WithBinaryBody(b []byte) RequestOption {
+	return func(r map[string]any) {
+		r["body"] = base64.StdEncoding.EncodeToString(b)
+		r["encoding"] = "base64"
+	}
+}
+
 // WithHeaders adds headers to the request.
 func WithHeaders(h map[string]string) RequestOption {
 	return func(r map[string]any) { r["headers"] = h }
@@ -685,6 +778,9 @@ type ExecuteResponse struct {
 	StatusCode int               `json:"statusCode"`
 	Headers    map[string]string `json:"headers"`
 	Body       json.RawMessage   `json:"body"`
+	// Encoding is "base64" when Body is a base64 string carrying a
+	// binary response payload, empty otherwise.
+	Encoding string `json:"encoding,omitempty"`
 }
 
 // ParseExecuteResult extracts the API response envelope from a

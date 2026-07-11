@@ -2,85 +2,268 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"sort"
 	"strings"
+	"time"
+	"unicode/utf8"
 
+	"github.com/dop251/goja"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Search domain constants.
-const (
-	SearchDomainListOrders  = "list_orders"
-	SearchDomainListPets    = "list_pets"
-	SearchDomainShowPetByID = "show_pet_by_id"
-)
+const searchDescription = "Discover API capabilities by running JavaScript against a read-only 'spec' object.\n\nUse this for endpoint discovery before execution.\n\nExample:\nconst matches = spec.operations.filter(op => op.tags.includes(\"pets\"));\nreturn matches.map(op => ({id: op.operationId, method: op.method, path: op.path}));"
+const executeDescription = "Execute API requests by running JavaScript against the 'api' helper.\n\nUse api.request({ method, path, pathParams?, query?, headers?, body?, encoding? }) to perform one or more requests.\n\n'body' is JSON-encoded and sent as application/json by default. For non-JSON payloads set 'encoding': \"text\" (body is a string, sent as UTF-8 text/plain) or \"base64\" (body is a base64 string, decoded and sent as raw bytes, application/octet-stream); an explicit Content-Type header overrides these defaults. pathParams values are percent-encoded, so multi-segment path values must be inlined into 'path' instead.\n\nEach request returns { statusCode, headers, body, encoding? }: body is parsed JSON when possible, plain text otherwise; binary response bodies come back base64-encoded with encoding: \"base64\".\n\nLimits: max_requests=10, timeout=5s, max_response_bytes=262144, max_output_bytes=524288.\n\nExample (multi-request):\nconst a = api.request({ method: \"GET\", path: \"/orders\", query: { limit: 3 } });\nconst b = api.request({ method: \"GET\", path: \"/pets\", query: { limit: 3 } });\nreturn { orders: a, pets: b };\n\nExample (raw upload):\nreturn api.request({ method: \"PUT\", path: \"/files/report.txt\", body: \"hello\", encoding: \"text\" });"
 
-// Execute action constants.
-const (
-	ExecuteActionTagPet      = "tag_pet"
-	ExecuteActionCreateOrder = "create_order"
-	ExecuteActionCreatePet   = "create_pet"
-	ExecuteActionDeletePet   = "delete_pet"
-	ExecuteActionUpdatePet   = "update_pet"
-)
+const embeddedSpecJSON = `{"openapi":"3.0.3","info":{"title":"Petstore","version":"1.0.0"},"operations":[{"operationId":"addPetTag","method":"POST","path":"/pets/{petId}/tags","summary":"Add a tag to a pet","description":"","tags":["pets"],"hasBody":true,"bodyRequired":true,"parameters":[{"name":"petId","in":"path","required":true,"type":"integer","example":1}],"bodyExample":{"tag":"example"},"exampleUri":"openapi://examples/addPetTag"},{"operationId":"createOrder","method":"POST","path":"/orders","summary":"Create an order","description":"","tags":["orders"],"hasBody":true,"bodyRequired":true,"parameters":[],"bodyExample":{"petId":1,"quantity":{"value":"example"}},"exampleUri":"openapi://examples/createOrder"},{"operationId":"createPet","method":"POST","path":"/pets","summary":"Create a pet","description":"","tags":["pets"],"hasBody":true,"bodyRequired":true,"parameters":[],"bodyExample":{"name":"example","status":{"value":"example"}},"exampleUri":"openapi://examples/createPet"},{"operationId":"deletePet","method":"DELETE","path":"/pets/{petId}","summary":"Delete a pet","description":"","tags":["pets"],"hasBody":false,"bodyRequired":false,"parameters":[{"name":"petId","in":"path","required":true,"type":"integer","example":1}],"exampleUri":"openapi://examples/deletePet"},{"operationId":"listOrders","method":"GET","path":"/orders","summary":"List all orders","description":"","tags":["orders"],"hasBody":false,"bodyRequired":false,"parameters":[{"name":"limit","in":"query","required":false,"type":"integer","example":{"value":"example"}}],"exampleUri":"openapi://examples/listOrders"},{"operationId":"listPets","method":"GET","path":"/pets","summary":"List all pets","description":"","tags":["pets"],"hasBody":false,"bodyRequired":false,"parameters":[{"name":"limit","in":"query","required":false,"type":"integer","example":{"value":"example"}},{"name":"status","in":"query","required":false,"type":"string","example":{"value":"example"}}],"exampleUri":"openapi://examples/listPets"},{"operationId":"showPetById","method":"GET","path":"/pets/{petId}","summary":"Get a pet by ID","description":"","tags":["pets"],"hasBody":false,"bodyRequired":false,"parameters":[{"name":"petId","in":"path","required":true,"type":"integer","example":1}],"exampleUri":"openapi://examples/showPetById"},{"operationId":"updatePet","method":"PUT","path":"/pets/{petId}","summary":"Update a pet","description":"","tags":["pets"],"hasBody":true,"bodyRequired":true,"parameters":[{"name":"petId","in":"path","required":true,"type":"integer","example":1}],"bodyExample":{"name":"example","status":{"value":"example"}},"exampleUri":"openapi://examples/updatePet"}],"schemas":[{"name":"CreateOrderRequest","uri":"openapi://schemas/CreateOrderRequest"},{"name":"CreatePetRequest","uri":"openapi://schemas/CreatePetRequest"},{"name":"Order","uri":"openapi://schemas/Order"},{"name":"Pet","uri":"openapi://schemas/Pet"}]}`
 
-// Handler defines the interface for MCP tool call handlers.
-type Handler interface {
-	// SearchListOrders handles the "list_orders" search domain.
-	// GET /orders — List all orders
-	// Params: limit (query, any, optional)
-	SearchListOrders(ctx context.Context, params json.RawMessage) (*mcp.CallToolResult, error)
+const embeddedOperationsJSON = `[{"operationId":"addPetTag","method":"POST","path":"/pets/{petId}/tags","summary":"Add a tag to a pet","tags":["pets"],"hasBody":true,"bodyRequired":true,"parameters":[{"name":"petId","in":"path","required":true,"type":"integer","example":1}],"bodyExample":{"tag":"example"}},{"operationId":"createOrder","method":"POST","path":"/orders","summary":"Create an order","tags":["orders"],"hasBody":true,"bodyRequired":true,"parameters":[],"bodyExample":{"petId":1,"quantity":{"value":"example"}}},{"operationId":"createPet","method":"POST","path":"/pets","summary":"Create a pet","tags":["pets"],"hasBody":true,"bodyRequired":true,"parameters":[],"bodyExample":{"name":"example","status":{"value":"example"}}},{"operationId":"deletePet","method":"DELETE","path":"/pets/{petId}","summary":"Delete a pet","tags":["pets"],"hasBody":false,"bodyRequired":false,"parameters":[{"name":"petId","in":"path","required":true,"type":"integer","example":1}]},{"operationId":"listOrders","method":"GET","path":"/orders","summary":"List all orders","tags":["orders"],"hasBody":false,"bodyRequired":false,"parameters":[{"name":"limit","in":"query","required":false,"type":"integer","example":{"value":"example"}}]},{"operationId":"listPets","method":"GET","path":"/pets","summary":"List all pets","tags":["pets"],"hasBody":false,"bodyRequired":false,"parameters":[{"name":"limit","in":"query","required":false,"type":"integer","example":{"value":"example"}},{"name":"status","in":"query","required":false,"type":"string","example":{"value":"example"}}]},{"operationId":"showPetById","method":"GET","path":"/pets/{petId}","summary":"Get a pet by ID","tags":["pets"],"hasBody":false,"bodyRequired":false,"parameters":[{"name":"petId","in":"path","required":true,"type":"integer","example":1}]},{"operationId":"updatePet","method":"PUT","path":"/pets/{petId}","summary":"Update a pet","tags":["pets"],"hasBody":true,"bodyRequired":true,"parameters":[{"name":"petId","in":"path","required":true,"type":"integer","example":1}],"bodyExample":{"name":"example","status":{"value":"example"}}}]`
 
-	// SearchListPets handles the "list_pets" search domain.
-	// GET /pets — List all pets
-	// Params: status (query, any, optional), limit (query, any, optional)
-	SearchListPets(ctx context.Context, params json.RawMessage) (*mcp.CallToolResult, error)
-
-	// SearchShowPetByID handles the "show_pet_by_id" search domain.
-	// GET /pets/{petId} — Get a pet by ID
-	// Params: petId (path, int64, required)
-	SearchShowPetByID(ctx context.Context, params json.RawMessage) (*mcp.CallToolResult, error)
-
-	// ExecuteTagPet handles the "tag_pet" execute action.
-	// POST /pets/{petId}/tags — Add a tag to a pet
-	// Params: petId (path, int64, required)
-	// Body: required
-	ExecuteTagPet(ctx context.Context, params json.RawMessage) (*mcp.CallToolResult, error)
-
-	// ExecuteCreateOrder handles the "create_order" execute action.
-	// POST /orders — Create an order
-	// Body: required
-	ExecuteCreateOrder(ctx context.Context, params json.RawMessage) (*mcp.CallToolResult, error)
-
-	// ExecuteCreatePet handles the "create_pet" execute action.
-	// POST /pets — Create a pet
-	// Body: required
-	ExecuteCreatePet(ctx context.Context, params json.RawMessage) (*mcp.CallToolResult, error)
-
-	// ExecuteDeletePet handles the "delete_pet" execute action.
-	// DELETE /pets/{petId} — Delete a pet
-	// Params: petId (path, int64, required)
-	ExecuteDeletePet(ctx context.Context, params json.RawMessage) (*mcp.CallToolResult, error)
-
-	// ExecuteUpdatePet handles the "update_pet" execute action.
-	// PUT /pets/{petId} — Update a pet
-	// Params: petId (path, int64, required)
-	// Body: required
-	ExecuteUpdatePet(ctx context.Context, params json.RawMessage) (*mcp.CallToolResult, error)
+// Engine executes Code Mode search/execute snippets.
+type Engine interface {
+	RunSearch(ctx context.Context, code string) (*mcp.CallToolResult, error)
+	RunExecute(ctx context.Context, code string) (*mcp.CallToolResult, error)
 }
 
-// RegisterTools registers search and execute tools with the MCP server.
-func RegisterTools(srv *mcp.Server, handler Handler) {
-	h := &generatedHandler{handler: handler}
+// CodeInput is the MCP tool input payload for search and execute.
+type CodeInput struct {
+	Code string `json:"code"`
+}
+
+// APIRequest is a normalized API request built from execute() code.
+type APIRequest struct {
+	Method     string
+	Path       string
+	PathParams map[string]string
+	Query      map[string]any
+	Headers    map[string]string
+	// Body holds the exact request bytes to send: nil means no body, a
+	// non-nil empty slice means an empty body. normalizeAPIRequest
+	// resolves JSON/text/base64 inputs into bytes and defaults the
+	// Content-Type header, so transports never re-encode.
+	Body         []byte
+	MaxRedirects int
+}
+
+// APIResponse is the host-provided API response returned to execute() code.
+type APIResponse struct {
+	StatusCode int
+	Headers    map[string]string
+	Body       any
+	// BodyEncoding is "base64" when Body carries base64-encoded bytes
+	// (the response was neither JSON nor valid UTF-8), empty otherwise.
+	BodyEncoding string
+}
+
+// APITransport executes normalized API requests for the generated engine.
+type APITransport interface {
+	DoAPIRequest(ctx context.Context, req APIRequest) (*APIResponse, error)
+}
+
+// RequestHook is called before every outgoing HTTP request, allowing
+// callers to inject auth headers, trace IDs, etc.
+type RequestHook func(ctx context.Context, req *http.Request) error
+
+// HTTPTransport is a concrete APITransport backed by net/http.
+type HTTPTransport struct {
+	baseURL     string
+	baseURLFunc func() string
+	httpClient  *http.Client
+	requestHook RequestHook
+}
+
+// HTTPTransportOption configures an HTTPTransport.
+type HTTPTransportOption func(*HTTPTransport)
+
+// WithHTTPClient sets a custom HTTP client on the transport.
+func WithHTTPClient(c *http.Client) HTTPTransportOption {
+	return func(t *HTTPTransport) { t.httpClient = c }
+}
+
+// WithRequestHook sets a hook called before each outgoing request.
+func WithRequestHook(h RequestHook) HTTPTransportOption {
+	return func(t *HTTPTransport) { t.requestHook = h }
+}
+
+// WithBaseURLFunc sets a function that resolves the base URL lazily
+// on each request. Overrides the static base URL.
+func WithBaseURLFunc(f func() string) HTTPTransportOption {
+	return func(t *HTTPTransport) { t.baseURLFunc = f }
+}
+
+// NewHTTPTransport creates an HTTPTransport for the given base URL.
+func NewHTTPTransport(baseURL string, opts ...HTTPTransportOption) *HTTPTransport {
+	t := &HTTPTransport{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		httpClient: http.DefaultClient,
+	}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
+}
+
+// DoAPIRequest executes the normalized API request via net/http.
+func (t *HTTPTransport) DoAPIRequest(ctx context.Context, req APIRequest) (*APIResponse, error) {
+	base := t.baseURL
+	if t.baseURLFunc != nil {
+		base = strings.TrimRight(t.baseURLFunc(), "/")
+	}
+
+	reqURL := base + req.Path
+
+	if len(req.Query) > 0 {
+		q := url.Values{}
+		for k, v := range req.Query {
+			q.Set(k, fmt.Sprint(v))
+		}
+		reqURL += "?" + q.Encode()
+	}
+
+	var bodyReader io.Reader
+	if req.Body != nil {
+		bodyReader = bytes.NewReader(req.Body)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, req.Method, reqURL, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("creating HTTP request: %w", err)
+	}
+
+	for k, v := range req.Headers {
+		httpReq.Header.Set(k, v)
+	}
+
+	if t.requestHook != nil {
+		if hookErr := t.requestHook(ctx, httpReq); hookErr != nil {
+			return nil, fmt.Errorf("request hook: %w", hookErr)
+		}
+	}
+
+	httpResp, err := t.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("executing HTTP request: %w", err)
+	}
+	defer func() { _ = httpResp.Body.Close() }()
+
+	respBody, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
+	respHeaders := make(map[string]string, len(httpResp.Header))
+	for k := range httpResp.Header {
+		respHeaders[k] = httpResp.Header.Get(k)
+	}
+
+	var body any
+	var bodyEncoding string
+	if len(respBody) > 0 {
+		switch {
+		case json.Unmarshal(respBody, &body) == nil:
+		case utf8.Valid(respBody):
+			body = string(respBody)
+		default:
+			// Binary payload: a Go string of invalid UTF-8 would be
+			// mangled to U+FFFD when re-marshaled into the tool result,
+			// so carry the bytes losslessly as base64 instead.
+			body = base64.StdEncoding.EncodeToString(respBody)
+			bodyEncoding = "base64"
+		}
+	}
+
+	return &APIResponse{
+		StatusCode:   httpResp.StatusCode,
+		Headers:      respHeaders,
+		Body:         body,
+		BodyEncoding: bodyEncoding,
+	}, nil
+}
+
+// EngineOptions controls execution limits for JS code.
+type EngineOptions struct {
+	ExecuteMaxRequests      int
+	ExecuteTimeout          time.Duration
+	ExecuteMaxResponseBytes int
+	ExecuteMaxOutputBytes   int
+	ExecuteMaxRedirects     int
+}
+
+func defaultEngineOptions() EngineOptions {
+	return EngineOptions{
+		ExecuteMaxRequests:      10,
+		ExecuteTimeout:          time.Duration(5000000000),
+		ExecuteMaxResponseBytes: 262144,
+		ExecuteMaxOutputBytes:   524288,
+		ExecuteMaxRedirects:     3,
+	}
+}
+
+// JSEngine is the default JavaScript engine implementation.
+type JSEngine struct {
+	transport APITransport
+	opts      EngineOptions
+	spec      map[string]any
+}
+
+// NewJSEngine constructs a default JS engine with embedded OpenAPI projection.
+func NewJSEngine(transport APITransport, options *EngineOptions) (*JSEngine, error) {
+	if transport == nil {
+		return nil, errors.New("transport is required")
+	}
+
+	opts := defaultEngineOptions()
+	if options != nil {
+		if options.ExecuteMaxRequests > 0 {
+			opts.ExecuteMaxRequests = options.ExecuteMaxRequests
+		}
+
+		if options.ExecuteTimeout > 0 {
+			opts.ExecuteTimeout = options.ExecuteTimeout
+		}
+
+		if options.ExecuteMaxResponseBytes > 0 {
+			opts.ExecuteMaxResponseBytes = options.ExecuteMaxResponseBytes
+		}
+
+		if options.ExecuteMaxOutputBytes > 0 {
+			opts.ExecuteMaxOutputBytes = options.ExecuteMaxOutputBytes
+		}
+
+		if options.ExecuteMaxRedirects >= 0 {
+			opts.ExecuteMaxRedirects = options.ExecuteMaxRedirects
+		}
+	}
+
+	var spec map[string]any
+	if err := json.Unmarshal([]byte(embeddedSpecJSON), &spec); err != nil {
+		return nil, fmt.Errorf("decoding embedded spec: %w", err)
+	}
+
+	return &JSEngine{
+		transport: transport,
+		opts:      opts,
+		spec:      spec,
+	}, nil
+}
+
+// RegisterTools registers the fixed search/execute Code Mode tools.
+func RegisterTools(srv *mcp.Server, engine Engine) {
+	h := &generatedHandler{engine: engine}
 
 	srv.AddTool(&mcp.Tool{
 		Name:        "search",
 		Title:       "Search",
 		Description: searchDescription,
-		InputSchema: searchInputSchema(),
+		InputSchema: codeInputSchema(),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, h.handleSearch)
 
@@ -88,118 +271,544 @@ func RegisterTools(srv *mcp.Server, handler Handler) {
 		Name:        "execute",
 		Title:       "Execute",
 		Description: executeDescription,
-		InputSchema: executeInputSchema(),
+		InputSchema: codeInputSchema(),
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: new(true)},
 	}, h.handleExecute)
 }
 
+func codeInputSchema() any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"code": map[string]any{
+				"type":        "string",
+				"description": "JavaScript source code to execute in this tool runtime.",
+			},
+		},
+		"required":             []string{"code"},
+		"additionalProperties": false,
+	}
+}
+
 type generatedHandler struct {
-	handler Handler
-}
-
-const searchDescription = "Search and discover:\n" +
-	"- list_orders: List all orders (limit)\n" +
-	"- list_pets: List all pets (status, limit)\n" +
-	"- show_pet_by_id: Get a pet by ID (petId)\n" +
-	""
-
-const executeDescription = "Execute actions:\n" +
-	"- tag_pet: Add a tag to a pet (petId, body)\n" +
-	"- create_order: Create an order (body)\n" +
-	"- create_pet: Create a pet (body)\n" +
-	"- delete_pet: Delete a pet (petId)\n" +
-	"- update_pet: Update a pet (petId, body)\n" +
-	""
-
-func searchInputSchema() any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"domain": map[string]any{
-				"type":        "string",
-				"description": "The search domain to query.",
-				"enum":        []string{SearchDomainListOrders, SearchDomainListPets, SearchDomainShowPetByID},
-			},
-			"params": map[string]any{
-				"type":        "object",
-				"description": "Parameters for the search domain. See tool description for accepted params per domain.",
-			},
-		},
-		"required":             []string{"domain"},
-		"additionalProperties": false,
-	}
-}
-
-func executeInputSchema() any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"action": map[string]any{
-				"type":        "string",
-				"description": "The action to execute.",
-				"enum":        []string{ExecuteActionTagPet, ExecuteActionCreateOrder, ExecuteActionCreatePet, ExecuteActionDeletePet, ExecuteActionUpdatePet},
-			},
-			"params": map[string]any{
-				"type":        "object",
-				"description": "Parameters for the action. See tool description for accepted params per action.",
-			},
-		},
-		"required":             []string{"action"},
-		"additionalProperties": false,
-	}
+	engine Engine
 }
 
 func (h *generatedHandler) handleSearch(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	var args struct {
-		Domain string          `json:"domain"`
-		Params json.RawMessage `json:"params"`
+	if h.engine == nil {
+		return nil, errors.New("engine is nil")
 	}
 
-	if err := json.Unmarshal(req.Params.Arguments, &args); err != nil {
-		return nil, fmt.Errorf("invalid search arguments: %w", err)
+	input, err := parseCodeInput(req)
+	if err != nil {
+		return nil, err
 	}
 
-	switch args.Domain {
-	case SearchDomainListOrders:
-		return h.handler.SearchListOrders(ctx, args.Params)
-	case SearchDomainListPets:
-		return h.handler.SearchListPets(ctx, args.Params)
-	case SearchDomainShowPetByID:
-		return h.handler.SearchShowPetByID(ctx, args.Params)
-	default:
-		available := []string{SearchDomainListOrders, SearchDomainListPets, SearchDomainShowPetByID}
-		return nil, fmt.Errorf("unknown search domain: %q, available: [%s]", args.Domain, strings.Join(available, ", "))
-	}
+	return h.engine.RunSearch(ctx, input.Code)
 }
 
 func (h *generatedHandler) handleExecute(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	var args struct {
-		Action string          `json:"action"`
-		Params json.RawMessage `json:"params"`
+	if h.engine == nil {
+		return nil, errors.New("engine is nil")
 	}
 
-	if err := json.Unmarshal(req.Params.Arguments, &args); err != nil {
-		return nil, fmt.Errorf("invalid execute arguments: %w", err)
+	input, err := parseCodeInput(req)
+	if err != nil {
+		return nil, err
 	}
 
-	switch args.Action {
-	case ExecuteActionTagPet:
-		return h.handler.ExecuteTagPet(ctx, args.Params)
-	case ExecuteActionCreateOrder:
-		return h.handler.ExecuteCreateOrder(ctx, args.Params)
-	case ExecuteActionCreatePet:
-		return h.handler.ExecuteCreatePet(ctx, args.Params)
-	case ExecuteActionDeletePet:
-		return h.handler.ExecuteDeletePet(ctx, args.Params)
-	case ExecuteActionUpdatePet:
-		return h.handler.ExecuteUpdatePet(ctx, args.Params)
-	default:
-		available := []string{ExecuteActionTagPet, ExecuteActionCreateOrder, ExecuteActionCreatePet, ExecuteActionDeletePet, ExecuteActionUpdatePet}
-		return nil, fmt.Errorf("unknown execute action: %q, available: [%s]", args.Action, strings.Join(available, ", "))
+	return h.engine.RunExecute(ctx, input.Code)
+}
+
+func parseCodeInput(req *mcp.CallToolRequest) (CodeInput, error) {
+	var input CodeInput
+
+	if err := json.Unmarshal(req.Params.Arguments, &input); err != nil {
+		return CodeInput{}, fmt.Errorf("invalid code input: %w", err)
+	}
+
+	if strings.TrimSpace(input.Code) == "" {
+		return CodeInput{}, errors.New("code must not be empty")
+	}
+
+	return input, nil
+}
+
+// RunSearch executes JavaScript against a read-only 'spec' object.
+func (e *JSEngine) RunSearch(ctx context.Context, code string) (*mcp.CallToolResult, error) {
+	runCtx, cancel := context.WithTimeout(ctx, e.opts.ExecuteTimeout)
+	defer cancel()
+
+	vm := goja.New()
+	if err := vm.Set("spec", e.spec); err != nil {
+		return nil, fmt.Errorf("setting spec runtime value: %w", err)
+	}
+
+	result, err := runUserCode(runCtx, vm, code)
+	if err != nil {
+		return userCodeErrorResult(err), nil
+	}
+
+	return toToolResult(result, e.opts.ExecuteMaxOutputBytes)
+}
+
+// RunExecute executes JavaScript against an API request helper.
+func (e *JSEngine) RunExecute(ctx context.Context, code string) (*mcp.CallToolResult, error) {
+	runCtx, cancel := context.WithTimeout(ctx, e.opts.ExecuteTimeout)
+	defer cancel()
+
+	vm := goja.New()
+	state := &executeState{}
+
+	api := map[string]any{
+		"request": e.apiRequestFunc(runCtx, state),
+	}
+	if err := vm.Set("api", api); err != nil {
+		return nil, fmt.Errorf("setting execute runtime helpers: %w", err)
+	}
+
+	result, err := runUserCode(runCtx, vm, code)
+	if err != nil {
+		return userCodeErrorResult(err), nil
+	}
+
+	return toToolResult(result, e.opts.ExecuteMaxOutputBytes)
+}
+
+type executeState struct {
+	requestCount int
+	outputBytes  int
+}
+
+func (e *JSEngine) apiRequestFunc(
+	ctx context.Context,
+	state *executeState,
+) func(map[string]any) (map[string]any, error) {
+	return func(input map[string]any) (map[string]any, error) {
+		if input == nil {
+			return nil, errors.New("api.request requires an object argument")
+		}
+
+		state.requestCount++
+		if state.requestCount > e.opts.ExecuteMaxRequests {
+			return nil, fmt.Errorf("execute request limit exceeded (%d)", e.opts.ExecuteMaxRequests)
+		}
+
+		req, err := normalizeAPIRequest(input)
+		if err != nil {
+			return nil, err
+		}
+		req.MaxRedirects = e.opts.ExecuteMaxRedirects
+
+		resp, err := e.transport.DoAPIRequest(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+
+		result := map[string]any{
+			"statusCode": resp.StatusCode,
+			"headers":    resp.Headers,
+			"body":       clampBody(resp.Body, e.opts.ExecuteMaxResponseBytes),
+		}
+		if resp.BodyEncoding != "" {
+			result["encoding"] = resp.BodyEncoding
+		}
+
+		payload, err := json.Marshal(result)
+		if err != nil {
+			return nil, fmt.Errorf("encoding response payload: %w", err)
+		}
+
+		if state.outputBytes+len(payload) > e.opts.ExecuteMaxOutputBytes {
+			return nil, fmt.Errorf("execute output limit exceeded (%d bytes)", e.opts.ExecuteMaxOutputBytes)
+		}
+
+		state.outputBytes += len(payload)
+
+		return result, nil
 	}
 }
 
-// schemaContents maps schema names to their compact JSON Schema definitions.
+func clampBody(body any, maxBytes int) any {
+	if maxBytes <= 0 {
+		return body
+	}
+
+	data, err := json.Marshal(body)
+	if err != nil {
+		return map[string]any{
+			"truncated": false,
+			"error":     "failed to encode body",
+		}
+	}
+
+	if len(data) <= maxBytes {
+		return body
+	}
+
+	text := string(data)
+	if len(text) > maxBytes {
+		text = text[:maxBytes]
+	}
+
+	return map[string]any{
+		"truncated": true,
+		"preview":   text,
+	}
+}
+
+func normalizeAPIRequest(input map[string]any) (APIRequest, error) {
+	method, err := stringField(input, "method")
+	if err != nil {
+		return APIRequest{}, err
+	}
+
+	path, err := stringField(input, "path")
+	if err != nil {
+		return APIRequest{}, err
+	}
+
+	req := APIRequest{
+		Method: strings.ToUpper(method),
+		Path:   path,
+	}
+
+	if rawPathParams, ok := input["pathParams"]; ok {
+		req.PathParams = toStringMap(rawPathParams)
+		req.Path = resolvePath(req.Path, req.PathParams)
+	}
+
+	if rawQuery, ok := input["query"]; ok {
+		req.Query = toAnyMap(rawQuery)
+	}
+
+	if rawHeaders, ok := input["headers"]; ok {
+		req.Headers = toStringMap(rawHeaders)
+	}
+
+	body, contentType, err := normalizeBody(input)
+	if err != nil {
+		return APIRequest{}, err
+	}
+	req.Body = body
+	if contentType != "" && !hasHeader(req.Headers, "Content-Type") {
+		if req.Headers == nil {
+			req.Headers = make(map[string]string, 1)
+		}
+		req.Headers["Content-Type"] = contentType
+	}
+
+	return req, nil
+}
+
+// normalizeBody resolves the body/encoding fields into request bytes and
+// a default Content-Type. Returns (nil, "", nil) when no body was given;
+// note JSON null and empty strings are present-but-possibly-empty bodies,
+// distinct from absent.
+func normalizeBody(input map[string]any) ([]byte, string, error) {
+	body, bodyOK := input["body"]
+
+	encoding := "json"
+	if rawEnc, encOK := input["encoding"]; encOK {
+		s, isString := rawEnc.(string)
+		if !isString || (s != "json" && s != "text" && s != "base64") {
+			return nil, "", errors.New(`field "encoding" must be "json", "text" or "base64"`)
+		}
+		if !bodyOK {
+			return nil, "", errors.New(`field "encoding" requires "body"`)
+		}
+		encoding = s
+	}
+
+	if !bodyOK {
+		return nil, "", nil
+	}
+
+	switch encoding {
+	case "text", "base64":
+		s, isString := body.(string)
+		if !isString {
+			return nil, "", fmt.Errorf(`field "body" must be a string when encoding is %q`, encoding)
+		}
+		if encoding == "text" {
+			return []byte(s), "text/plain; charset=utf-8", nil
+		}
+		decoded, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return nil, "", fmt.Errorf("decoding base64 body: %w", err)
+		}
+		return decoded, "application/octet-stream", nil
+	default:
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, "", fmt.Errorf("encoding request body: %w", err)
+		}
+		return data, "application/json", nil
+	}
+}
+
+func hasHeader(headers map[string]string, name string) bool {
+	for k := range headers {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func resolvePath(path string, params map[string]string) string {
+	resolved := path
+
+	for key, value := range params {
+		placeholder := "{" + key + "}"
+		resolved = strings.ReplaceAll(resolved, placeholder, url.PathEscape(value))
+	}
+
+	return resolved
+}
+
+func toAnyMap(raw any) map[string]any {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	result := make(map[string]any, len(m))
+	for k, v := range m {
+		result[k] = v
+	}
+
+	return result
+}
+
+func toStringMap(raw any) map[string]string {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	result := make(map[string]string, len(m))
+	for k, v := range m {
+		result[k] = fmt.Sprint(v)
+	}
+
+	return result
+}
+
+func stringField(input map[string]any, key string) (string, error) {
+	value, ok := input[key]
+	if !ok {
+		return "", fmt.Errorf("missing required field %q", key)
+	}
+
+	s, ok := value.(string)
+	if !ok || strings.TrimSpace(s) == "" {
+		return "", fmt.Errorf("field %q must be a non-empty string", key)
+	}
+
+	return s, nil
+}
+
+func runUserCode(ctx context.Context, vm *goja.Runtime, code string) (any, error) {
+	script := "(function(){\n" + code + "\n})()"
+
+	type runResult struct {
+		value goja.Value
+		err   error
+	}
+
+	resultCh := make(chan runResult, 1)
+
+	go func() {
+		value, err := vm.RunString(script)
+		resultCh <- runResult{value: value, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		vm.Interrupt(ctx.Err())
+		<-resultCh
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		if result.err != nil {
+			return nil, result.err
+		}
+
+		return result.value.Export(), nil
+	}
+}
+
+func toToolResult(value any, maxBytes int) (*mcp.CallToolResult, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("encoding tool result: %w", err)
+	}
+
+	text := string(data)
+	if maxBytes > 0 && len(text) > maxBytes {
+		text = text[:maxBytes]
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: text},
+		},
+	}, nil
+}
+
+// userCodeErrorResult wraps a user-code failure (goja parse error, thrown
+// exception, runtime TypeError, execution limit trip, timeout) as an MCP
+// tool-error result. Per MCP's tool-error contract, these should surface
+// as CallToolResult{IsError: true} with a nil Go error so the model sees
+// the diagnostic in its tool_result and can self-correct. Go errors are
+// reserved for engine-level faults the model cannot recover from.
+func userCodeErrorResult(err error) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: err.Error()},
+		},
+	}
+}
+
+// --- Engine Hook ---
+
+// EngineHookFunc is called after each RunSearch/RunExecute for
+// per-invocation observability (audit logging, metrics, etc.).
+type EngineHookFunc func(ctx context.Context, tool, code string,
+	result *mcp.CallToolResult, err error, duration time.Duration)
+
+// WithEngineHook wraps an Engine with a post-invocation hook.
+func WithEngineHook(engine Engine, hook EngineHookFunc) Engine {
+	return &hookedEngine{inner: engine, hook: hook}
+}
+
+type hookedEngine struct {
+	inner Engine
+	hook  EngineHookFunc
+}
+
+func (e *hookedEngine) RunSearch(ctx context.Context, code string) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	result, err := e.inner.RunSearch(ctx, code)
+	e.hook(ctx, "search", code, result, err, time.Since(start))
+	return result, err
+}
+
+func (e *hookedEngine) RunExecute(ctx context.Context, code string) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	result, err := e.inner.RunExecute(ctx, code)
+	e.hook(ctx, "execute", code, result, err, time.Since(start))
+	return result, err
+}
+
+// --- Transport Hook ---
+
+// TransportHookFunc is called after each DoAPIRequest for
+// per-request observability (audit logging, metrics, etc.).
+type TransportHookFunc func(ctx context.Context, req APIRequest,
+	resp *APIResponse, err error, duration time.Duration)
+
+// WithTransportHook wraps an APITransport with a post-request hook.
+func WithTransportHook(transport APITransport, hook TransportHookFunc) APITransport {
+	return &hookedTransport{inner: transport, hook: hook}
+}
+
+type hookedTransport struct {
+	inner APITransport
+	hook  TransportHookFunc
+}
+
+func (t *hookedTransport) DoAPIRequest(ctx context.Context, req APIRequest) (*APIResponse, error) {
+	start := time.Now()
+	resp, err := t.inner.DoAPIRequest(ctx, req)
+	t.hook(ctx, req, resp, err, time.Since(start))
+	return resp, err
+}
+
+// --- Client Helpers ---
+
+// RequestOption configures an API request map for BuildExecuteCode.
+type RequestOption func(map[string]any)
+
+// WithQuery adds query parameters to the request.
+func WithQuery(q map[string]any) RequestOption {
+	return func(r map[string]any) { r["query"] = q }
+}
+
+// WithBody adds a JSON body to the request.
+func WithBody(b any) RequestOption {
+	return func(r map[string]any) { r["body"] = b }
+}
+
+// WithTextBody adds a plain-text body to the request.
+func WithTextBody(s string) RequestOption {
+	return func(r map[string]any) {
+		r["body"] = s
+		r["encoding"] = "text"
+	}
+}
+
+// WithBinaryBody adds a binary body to the request, carried as base64.
+func WithBinaryBody(b []byte) RequestOption {
+	return func(r map[string]any) {
+		r["body"] = base64.StdEncoding.EncodeToString(b)
+		r["encoding"] = "base64"
+	}
+}
+
+// WithHeaders adds headers to the request.
+func WithHeaders(h map[string]string) RequestOption {
+	return func(r map[string]any) { r["headers"] = h }
+}
+
+// BuildExecuteCode returns a JS snippet that calls api.request()
+// and returns the response. For Go MCP clients building code strings.
+func BuildExecuteCode(method, path string, opts ...RequestOption) string {
+	req := map[string]any{"method": strings.ToUpper(method), "path": path}
+	for _, opt := range opts {
+		opt(req)
+	}
+	data, _ := json.Marshal(req)
+	return "return api.request(" + string(data) + ");"
+}
+
+// ExecuteResponse is the parsed envelope from an execute tool result.
+type ExecuteResponse struct {
+	StatusCode int               `json:"statusCode"`
+	Headers    map[string]string `json:"headers"`
+	Body       json.RawMessage   `json:"body"`
+	// Encoding is "base64" when Body is a base64 string carrying a
+	// binary response payload, empty otherwise.
+	Encoding string `json:"encoding,omitempty"`
+}
+
+// ParseExecuteResult extracts the API response envelope from a
+// CallToolResult. Returns an error for MCP errors or HTTP >= 400.
+func ParseExecuteResult(result *mcp.CallToolResult) (*ExecuteResponse, error) {
+	if result == nil || len(result.Content) == 0 {
+		return nil, errors.New("empty execute result")
+	}
+	if result.IsError {
+		if tc, ok := result.Content[0].(*mcp.TextContent); ok {
+			return nil, fmt.Errorf("execute error: %s", tc.Text)
+		}
+		return nil, errors.New("execute failed")
+	}
+	tc, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		return nil, fmt.Errorf("unexpected content type: %T", result.Content[0])
+	}
+	var resp ExecuteResponse
+	if err := json.Unmarshal([]byte(tc.Text), &resp); err != nil {
+		return nil, fmt.Errorf("decoding execute response: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return &resp, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(resp.Body))
+	}
+	return &resp, nil
+}
+
 var schemaContents = map[string]string{
 	"CreateOrderRequest": `{"type":"object","properties":{"petId":{"type":"integer","format":"int64"},"quantity":{"type":"integer","format":"int32"}},"required":["petId"]}`,
 	"CreatePetRequest":   `{"type":"object","properties":{"name":{"type":"string"},"status":{"type":"string","enum":["available","pending","sold"]}},"required":["name"]}`,
@@ -207,45 +816,225 @@ var schemaContents = map[string]string{
 	"Pet":                `{"type":"object","properties":{"id":{"type":"integer","format":"int64"},"name":{"type":"string"},"status":{"type":"string","enum":["available","pending","sold"]},"tags":{"type":"array","items":{"type":"string"}}},"required":["id","name"]}`,
 }
 
-// RegisterResources registers schema resources with the MCP server.
-func RegisterResources(srv *mcp.Server) {
-	srv.AddResource(&mcp.Resource{
-		URI:         "openapi://schemas",
-		Name:        "schemas",
-		Title:       "API Schemas",
-		Description: "List all API schemas: " + schemaNamesList(),
-		MIMEType:    "application/json",
-	}, handleSchemaList)
-
-	srv.AddResourceTemplate(&mcp.ResourceTemplate{
-		URITemplate: "openapi://schemas/{name}",
-		Name:        "schema",
-		Title:       "API Schema",
-		Description: "Get a specific API schema definition by name",
-		MIMEType:    "application/json",
-	}, handleSchemaRead)
+var schemaDescriptions = map[string]string{
+	"CreateOrderRequest": "",
+	"CreatePetRequest":   "",
+	"Order":              "",
+	"Pet":                "",
 }
 
-func schemaNamesList() string {
-	names := make([]string, 0, len(schemaContents))
-	for name := range schemaContents {
-		names = append(names, name)
+type exampleRecord struct {
+	OperationID string
+	Method      string
+	Path        string
+	Summary     string
+	Code        string
+}
+
+var exampleContents = map[string]exampleRecord{
+	"addPetTag": {
+		OperationID: "addPetTag",
+		Method:      "POST",
+		Path:        "/pets/{petId}/tags",
+		Summary:     "Add a tag to a pet",
+		Code: `const response = api.request({
+  "body": {
+    "tag": "example"
+  },
+  "method": "POST",
+  "path": "/pets/{petId}/tags",
+  "pathParams": {
+    "petId": 1
+  }
+});
+return response;`,
+	},
+	"createOrder": {
+		OperationID: "createOrder",
+		Method:      "POST",
+		Path:        "/orders",
+		Summary:     "Create an order",
+		Code: `const response = api.request({
+  "body": {
+    "petId": 1,
+    "quantity": {
+      "value": "example"
+    }
+  },
+  "method": "POST",
+  "path": "/orders"
+});
+return response;`,
+	},
+	"createPet": {
+		OperationID: "createPet",
+		Method:      "POST",
+		Path:        "/pets",
+		Summary:     "Create a pet",
+		Code: `const response = api.request({
+  "body": {
+    "name": "example",
+    "status": {
+      "value": "example"
+    }
+  },
+  "method": "POST",
+  "path": "/pets"
+});
+return response;`,
+	},
+	"deletePet": {
+		OperationID: "deletePet",
+		Method:      "DELETE",
+		Path:        "/pets/{petId}",
+		Summary:     "Delete a pet",
+		Code: `const response = api.request({
+  "method": "DELETE",
+  "path": "/pets/{petId}",
+  "pathParams": {
+    "petId": 1
+  }
+});
+return response;`,
+	},
+	"listOrders": {
+		OperationID: "listOrders",
+		Method:      "GET",
+		Path:        "/orders",
+		Summary:     "List all orders",
+		Code: `const response = api.request({
+  "method": "GET",
+  "path": "/orders"
+});
+return response;`,
+	},
+	"listPets": {
+		OperationID: "listPets",
+		Method:      "GET",
+		Path:        "/pets",
+		Summary:     "List all pets",
+		Code: `const response = api.request({
+  "method": "GET",
+  "path": "/pets"
+});
+return response;`,
+	},
+	"showPetById": {
+		OperationID: "showPetById",
+		Method:      "GET",
+		Path:        "/pets/{petId}",
+		Summary:     "Get a pet by ID",
+		Code: `const response = api.request({
+  "method": "GET",
+  "path": "/pets/{petId}",
+  "pathParams": {
+    "petId": 1
+  }
+});
+return response;`,
+	},
+	"updatePet": {
+		OperationID: "updatePet",
+		Method:      "PUT",
+		Path:        "/pets/{petId}",
+		Summary:     "Update a pet",
+		Code: `const response = api.request({
+  "body": {
+    "name": "example",
+    "status": {
+      "value": "example"
+    }
+  },
+  "method": "PUT",
+  "path": "/pets/{petId}",
+  "pathParams": {
+    "petId": 1
+  }
+});
+return response;`,
+	},
+}
+
+// RegisterResources registers generated schema/example resources.
+func RegisterResources(srv *mcp.Server) {
+	if len(schemaContents) > 0 {
+		srv.AddResource(&mcp.Resource{
+			URI:         "openapi" + "://schemas",
+			Name:        "schemas",
+			Title:       "API Schemas",
+			Description: "List available API schemas",
+			MIMEType:    "application/json",
+		}, handleSchemaList)
+
+		srv.AddResourceTemplate(&mcp.ResourceTemplate{
+			URITemplate: "openapi" + "://schemas/{name}",
+			Name:        "schema",
+			Title:       "API Schema",
+			Description: "Read a specific API schema",
+			MIMEType:    "application/json",
+		}, handleSchemaRead)
 	}
-	sort.Strings(names)
-	return strings.Join(names, ", ")
+
+	if len(exampleContents) > 0 {
+		srv.AddResource(&mcp.Resource{
+			URI:         "openapi" + "://examples",
+			Name:        "examples",
+			Title:       "API Examples",
+			Description: "List generated operation snippets",
+			MIMEType:    "application/json",
+		}, handleExampleList)
+
+		srv.AddResourceTemplate(&mcp.ResourceTemplate{
+			URITemplate: "openapi" + "://examples/{operationId}",
+			Name:        "example",
+			Title:       "API Example",
+			Description: "Read a generated snippet for an operation",
+			MIMEType:    "application/javascript",
+		}, handleExampleRead)
+	}
+
+	if embeddedOperationsJSON != "" {
+		srv.AddResource(&mcp.Resource{
+			URI:         "openapi" + "://operations",
+			Name:        "operations",
+			Title:       "API Operations",
+			Description: "List enriched API operations with parameters and examples",
+			MIMEType:    "application/json",
+		}, handleOperationsList)
+	}
+}
+
+func handleOperationsList(_ context.Context, _ *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	rc := &mcp.ResourceContents{
+		URI:      "openapi" + "://operations",
+		MIMEType: "application/json",
+		Text:     embeddedOperationsJSON,
+	}
+
+	return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{rc}}, nil
 }
 
 func handleSchemaList(_ context.Context, _ *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 	type entry struct {
 		Name        string `json:"name"`
 		Description string `json:"description,omitempty"`
+		URI         string `json:"uri"`
 	}
 
-	entries := make([]entry, 0, len(schemaContents))
-	entries = append(entries, entry{Name: "CreateOrderRequest", Description: ""})
-	entries = append(entries, entry{Name: "CreatePetRequest", Description: ""})
-	entries = append(entries, entry{Name: "Order", Description: ""})
-	entries = append(entries, entry{Name: "Pet", Description: ""})
+	names := make([]string, 0, len(schemaContents))
+	for name := range schemaContents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	entries := make([]entry, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, entry{
+			Name:        name,
+			Description: schemaDescriptions[name],
+			URI:         "openapi" + "://schemas/" + name,
+		})
+	}
 
 	data, err := json.Marshal(entries)
 	if err != nil {
@@ -253,25 +1042,22 @@ func handleSchemaList(_ context.Context, _ *mcp.ReadResourceRequest) (*mcp.ReadR
 	}
 
 	rc := &mcp.ResourceContents{
-		URI:      "openapi://schemas",
+		URI:      "openapi" + "://schemas",
 		MIMEType: "application/json",
 		Text:     string(data),
 	}
 
-	return &mcp.ReadResourceResult{
-		Contents: []*mcp.ResourceContents{rc},
-	}, nil
+	return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{rc}}, nil
 }
 
 func handleSchemaRead(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 	uri := req.Params.URI
-	const prefix = "openapi://schemas/"
+	prefix := "openapi" + "://schemas/"
 	if !strings.HasPrefix(uri, prefix) {
 		return nil, mcp.ResourceNotFoundError(uri)
 	}
 
 	name := strings.TrimPrefix(uri, prefix)
-
 	content, ok := schemaContents[name]
 	if !ok {
 		return nil, mcp.ResourceNotFoundError(uri)
@@ -283,7 +1069,68 @@ func handleSchemaRead(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.Rea
 		Text:     content,
 	}
 
-	return &mcp.ReadResourceResult{
-		Contents: []*mcp.ResourceContents{rc},
-	}, nil
+	return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{rc}}, nil
+}
+
+func handleExampleList(_ context.Context, _ *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	type entry struct {
+		OperationID string `json:"operationId"`
+		Method      string `json:"method"`
+		Path        string `json:"path"`
+		Summary     string `json:"summary,omitempty"`
+		URI         string `json:"uri"`
+	}
+
+	ids := make([]string, 0, len(exampleContents))
+	for id := range exampleContents {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	entries := make([]entry, 0, len(ids))
+	for _, id := range ids {
+		ex := exampleContents[id]
+		entries = append(entries, entry{
+			OperationID: ex.OperationID,
+			Method:      ex.Method,
+			Path:        ex.Path,
+			Summary:     ex.Summary,
+			URI:         "openapi" + "://examples/" + id,
+		})
+	}
+
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling example list: %w", err)
+	}
+
+	rc := &mcp.ResourceContents{
+		URI:      "openapi" + "://examples",
+		MIMEType: "application/json",
+		Text:     string(data),
+	}
+
+	return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{rc}}, nil
+}
+
+func handleExampleRead(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	uri := req.Params.URI
+	prefix := "openapi" + "://examples/"
+	if !strings.HasPrefix(uri, prefix) {
+		return nil, mcp.ResourceNotFoundError(uri)
+	}
+
+	id := strings.TrimPrefix(uri, prefix)
+	ex, ok := exampleContents[id]
+	if !ok {
+		return nil, mcp.ResourceNotFoundError(uri)
+	}
+
+	rc := &mcp.ResourceContents{
+		URI:      uri,
+		MIMEType: "application/javascript",
+		Text:     ex.Code,
+	}
+
+	return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{rc}}, nil
 }
